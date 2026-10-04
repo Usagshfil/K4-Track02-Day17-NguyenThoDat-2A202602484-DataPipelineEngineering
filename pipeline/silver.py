@@ -62,13 +62,16 @@ def ensure_tables(con: duckdb.DuckDBPyConnection) -> None:
 # ── tickets ─────────────────────────────────────────────────────────────────
 
 def upsert_silver_tickets(con: duckdb.DuckDBPyConnection, day: str) -> dict:
-    """Apply one day's CDC batch to silver_tickets."""
+    """Apply one day's CDC batch to silver_tickets with keyed upsert and LSN guard."""
     # Within one batch a ticket can change several times (and Kafka may deliver
     # the same change twice): keep only its latest change, by LSN.
+    # When a delete arrives (_op = 'd'), personal info must be cleared (tombstone).
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE _latest_changes AS
-        SELECT ticket_id, user_id,
-               mask_pii(subject) AS subject, mask_pii(body) AS body,
+        SELECT ticket_id,
+               CASE WHEN _op = 'd' THEN NULL ELSE user_id END AS user_id,
+               CASE WHEN _op = 'd' THEN NULL ELSE mask_pii(subject) END AS subject,
+               CASE WHEN _op = 'd' THEN NULL ELSE mask_pii(body) END AS body,
                priority, status, category, created_at, updated_at,
                (_op = 'd') AS is_deleted, _lsn, _batch_id
         FROM ({ticket_changes_sql(batch=day)})
@@ -76,17 +79,31 @@ def upsert_silver_tickets(con: duckdb.DuckDBPyConnection, day: str) -> dict:
     """)
     (n_changes,) = con.execute("SELECT count(*) FROM _latest_changes").fetchone()
 
-    # Write this batch's changes to Silver.
-    # A delete arrives as a change with is_deleted = true and every PII column null.
+    # Keyed upsert with LSN guard:
+    # 1. Delete rows in silver_tickets that are updated by newer or equal LSN in this batch
+    con.execute("""
+        DELETE FROM silver_tickets
+        WHERE ticket_id IN (
+            SELECT c.ticket_id
+            FROM _latest_changes c
+            JOIN silver_tickets t ON t.ticket_id = c.ticket_id
+            WHERE c._lsn >= t._lsn
+        )
+    """)
+
+    # 2. Insert records that either do not exist yet OR have a strictly newer/equal LSN
     con.execute("""
         INSERT INTO silver_tickets
-        SELECT ticket_id, user_id, subject, body, priority, status, category,
-               created_at, updated_at, is_deleted, _lsn, _batch_id
-        FROM _latest_changes
+        SELECT c.ticket_id, c.user_id, c.subject, c.body, c.priority, c.status, c.category,
+               c.created_at, c.updated_at, c.is_deleted, c._lsn, c._batch_id
+        FROM _latest_changes c
+        WHERE NOT EXISTS (
+            SELECT 1 FROM silver_tickets t
+            WHERE t.ticket_id = c.ticket_id AND t._lsn > c._lsn
+        )
     """)
     (n_rows,) = con.execute("SELECT count(*) FROM silver_tickets").fetchone()
     return {"changes_in_batch": n_changes, "silver_rows": n_rows}
-
 
 def build_ticket_history(con: duckdb.DuckDBPyConnection) -> int:
     """SCD Type 2 over everything landed so far: one row per version of a ticket.
